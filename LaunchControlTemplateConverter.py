@@ -11,6 +11,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Initialize session state
+if 'df' not in st.session_state:
+    st.session_state.df = None
+if 'column_mapping' not in st.session_state:
+    st.session_state.column_mapping = {}
+if 'phone_mapping' not in st.session_state:
+    st.session_state.phone_mapping = []
+if 'mapping_complete' not in st.session_state:
+    st.session_state.mapping_complete = False
+
 OUTPUT_COLUMNS = {
     'FirstName': {'required': True, 'description': 'Contact first name'},
     'LastName': {'required': True, 'description': 'Contact last name'},
