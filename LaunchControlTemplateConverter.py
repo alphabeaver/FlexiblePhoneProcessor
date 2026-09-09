@@ -1,6 +1,7 @@
 import csv
 import io
 import re
+import zipfile
 from datetime import datetime
 
 import numpy as np
@@ -142,6 +143,51 @@ def load_table(uploaded_file):
     return df, header_idx
 
 
+def load_uploads(uploaded_files):
+    """Read every upload, keeping one bad file from killing the whole batch."""
+    loaded, empty, failed = [], [], []
+
+    for uploaded_file in uploaded_files:
+        try:
+            df, header_idx = load_table(uploaded_file)
+        except Exception as e:
+            failed.append((uploaded_file.name, str(e)))
+            continue
+
+        if df.empty:
+            empty.append(uploaded_file.name)
+            continue
+
+        loaded.append({
+            'name': uploaded_file.name,
+            'size': uploaded_file.size,
+            'df': df,
+            'header_idx': header_idx,
+        })
+
+    return loaded, empty, failed
+
+
+def describe_column_differences(loaded):
+    """Compare each file's columns against the first file's.
+
+    The first upload is the template the mapping is built from; anything a later
+    file is missing simply comes out blank for that file's rows.
+    """
+    canonical = list(loaded[0]['df'].columns)
+    canonical_set = set(canonical)
+
+    differences = []
+    for item in loaded[1:]:
+        cols = set(item['df'].columns)
+        missing = [c for c in canonical if c not in cols]
+        extra = [c for c in item['df'].columns if c not in canonical_set]
+        if missing or extra:
+            differences.append({'name': item['name'], 'missing': missing, 'extra': extra})
+
+    return canonical, differences
+
+
 # ------------------------------------------------------------ phone extraction
 
 def normalize_phone_series(series):
@@ -273,10 +319,21 @@ def _default_index(columns, suggested):
     return 0
 
 
-def create_column_mapping_interface(df):
-    """Render the mapping UI and return True when the mapping is usable."""
+def create_column_mapping_interface(df, file_count=1, template_name=None):
+    """Render the mapping UI and return True when the mapping is usable.
+
+    One mapping covers the whole batch — the column names come from the first
+    upload and are applied to every file.
+    """
     st.markdown("## 🔄 Column Mapping")
-    st.markdown("Map your file's columns to the Launch Control output format:")
+    if file_count > 1:
+        st.markdown(
+            f"Map the columns once — the same mapping is applied to all "
+            f"**{file_count} files**. Column names are read from "
+            f"**{template_name}**."
+        )
+    else:
+        st.markdown("Map your file's columns to the Launch Control output format:")
 
     columns = df.columns.tolist()
     options = ['None'] + columns
@@ -403,19 +460,36 @@ def apply_full_name_fallback(df, final_df):
     return final_df
 
 
-def generate_qa_report(original_df, final_df, phone_stats):
-    rows = [
-        ['Total Contacts in Original File', f"{len(original_df):,}"],
+def rows_with_a_phone(final_df):
+    if final_df.empty:
+        return 0
+    return int((final_df[PHONE_COLUMNS] != '').any(axis=1).sum())
+
+
+def generate_qa_report(per_file, final_df, duplicates_removed, deduped):
+    source_rows = sum(item['source_rows'] for item in per_file)
+    total_valid = sum(item['phone_stats']['total_valid'] for item in per_file)
+    within_row_dupes = sum(item['phone_stats']['duplicates_dropped'] for item in per_file)
+    with_phone = rows_with_a_phone(final_df)
+    expected = source_rows - duplicates_removed
+
+    rows = [['Files Processed', f"{len(per_file):,}"]] if len(per_file) > 1 else []
+    rows += [
+        ['Total Contacts in Source File(s)', f"{source_rows:,}"],
+    ]
+    if deduped:
+        rows.append(['Duplicate Rows Removed Across Files', f"{duplicates_removed:,}"])
+    rows += [
         ['Contacts in Output File', f"{len(final_df):,}"],
         [
             'Contact Count Verification',
-            '✅ MATCH' if len(original_df) == len(final_df) else '❌ MISMATCH',
+            '✅ MATCH' if expected == len(final_df) else '❌ MISMATCH',
         ],
         ['', ''],
-        ['Contacts with At Least One Phone', f"{phone_stats['rows_with_any']:,}"],
-        ['Contacts with No Phone', f"{len(final_df) - phone_stats['rows_with_any']:,}"],
-        ['Total Phone Numbers in Original Data', f"{phone_stats['total_valid']:,}"],
-        ['Duplicate Numbers Skipped', f"{phone_stats['duplicates_dropped']:,}"],
+        ['Contacts with At Least One Phone', f"{with_phone:,}"],
+        ['Contacts with No Phone', f"{len(final_df) - with_phone:,}"],
+        ['Total Phone Numbers in Source Data', f"{total_valid:,}"],
+        ['Duplicate Numbers Skipped', f"{within_row_dupes:,}"],
         ['', ''],
         ['Phone Distribution in Output:', ''],
     ]
@@ -425,29 +499,66 @@ def generate_qa_report(original_df, final_df, phone_stats):
     return pd.DataFrame(rows, columns=['QA CHECK', 'RESULT'])
 
 
-def process_data_with_mapping(df, column_mapping, phone_mapping):
+def generate_file_breakdown(per_file):
+    rows = []
+    for item in per_file:
+        frame = item['final_df']
+        rows.append({
+            'File': item['name'],
+            'Rows': f"{len(frame):,}",
+            'With Phone': f"{rows_with_a_phone(frame):,}",
+            'Phone1': f"{int((frame['Phone1'] != '').sum()):,}",
+            'Phone2': f"{int((frame['Phone2'] != '').sum()):,}",
+            'Phone3': f"{int((frame['Phone3'] != '').sum()):,}",
+        })
+    return pd.DataFrame(rows)
+
+
+def process_one_frame(df, column_mapping, phone_mapping):
+    active_phone_cols = [c for c in phone_mapping if c != 'None']
+    phones_df, phone_stats = build_phone_frame(df, active_phone_cols)
+    final_df = build_output(df, column_mapping, phones_df)
+    final_df = apply_full_name_fallback(df, final_df)
+    return final_df, phone_stats
+
+
+def process_all_files(loaded, column_mapping, phone_mapping):
+    """Run one mapping across every uploaded file."""
     progress = st.progress(0)
     status = st.empty()
 
-    active_phone_cols = [c for c in phone_mapping if c != 'None']
-
-    status.text("📞 Extracting the top 3 phone numbers per contact...")
-    progress.progress(30)
-    phones_df, phone_stats = build_phone_frame(df, active_phone_cols)
-
-    status.text("📋 Formatting output data...")
-    progress.progress(65)
-    final_df = build_output(df, column_mapping, phones_df)
-    final_df = apply_full_name_fallback(df, final_df)
+    per_file = []
+    for i, item in enumerate(loaded):
+        status.text(f"📞 Processing {item['name']} ({i + 1} of {len(loaded)})...")
+        final_df, phone_stats = process_one_frame(item['df'], column_mapping, phone_mapping)
+        per_file.append({
+            'name': item['name'],
+            'source_rows': len(item['df']),
+            'final_df': final_df,
+            'phone_stats': phone_stats,
+            'suggested_name': suggest_filename(final_df, item['name']),
+        })
+        progress.progress(int((i + 1) / len(loaded) * 90))
 
     status.text("📊 Generating QA report...")
-    progress.progress(85)
-    qa_summary = generate_qa_report(df, final_df, phone_stats)
-
     progress.progress(100)
     status.text("✅ Processing complete!")
 
-    return final_df, qa_summary
+    return per_file
+
+
+def combine_outputs(per_file, drop_duplicates):
+    """Stack every file's output into the single frame Launch Control imports."""
+    combined = pd.concat(
+        [item['final_df'] for item in per_file], ignore_index=True
+    )
+
+    if not drop_duplicates:
+        return combined, 0
+
+    before = len(combined)
+    combined = combined.drop_duplicates().reset_index(drop=True)
+    return combined, before - len(combined)
 
 
 # -------------------------------------------------------------------- filenames
@@ -529,13 +640,52 @@ def to_excel_bytes(df):
     return buffer.getvalue()
 
 
+def unique_names(names, hints=None):
+    """Keep zip entries distinct when files land on the same suggested name.
+
+    Several pulls from one county all suggest the same LC name, so a collision
+    falls back to the upload's own file name before resorting to a counter.
+    """
+    hints = hints or [''] * len(names)
+    duplicated = {name for name in names if names.count(name) > 1}
+
+    out, used = [], set()
+    for name, hint in zip(names, hints):
+        candidate = f"{name}_{hint}" if name in duplicated and hint else name
+        final, suffix = candidate, 2
+        while final in used:
+            final = f"{candidate}_{suffix}"
+            suffix += 1
+        used.add(final)
+        out.append(final)
+    return out
+
+
+def to_zip_bytes(per_file):
+    """One .xlsx per upload, each under its own suggested Launch Control name."""
+    names = unique_names(
+        [sanitize_filename(item['suggested_name']) for item in per_file],
+        [sanitize_filename(item['name']) for item in per_file],
+    )
+    entries = [f"{name}.xlsx" for name in names]
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for entry, item in zip(entries, per_file):
+            archive.writestr(entry, to_excel_bytes(item['final_df']))
+    buffer.seek(0)
+    return buffer.getvalue(), entries
+
+
 # ------------------------------------------------------------------------- app
 
 def init_session_state():
     defaults = {
         'column_mapping': {},
         'phone_mapping': [],
-        'file_id': None,
+        'file_signature': None,
+        'columns_signature': None,
+        'loaded': None,
         'results': None,
     }
     for key, value in defaults.items():
@@ -543,8 +693,12 @@ def init_session_state():
             st.session_state[key] = value
 
 
-def reset_for_new_file(file_id):
-    """Clear stale widget state so a new file's columns map cleanly."""
+def reset_mapping_widgets():
+    """Clear stale widget state so a new column layout maps cleanly.
+
+    Only called when the column names change — adding another file that shares
+    the template keeps the mapping already on screen.
+    """
     stale = [
         k for k in st.session_state
         if k.startswith('mapping_') or k.startswith('phone_col_')
@@ -554,48 +708,78 @@ def reset_for_new_file(file_id):
 
     st.session_state.column_mapping = {}
     st.session_state.phone_mapping = []
-    st.session_state.results = None
-    st.session_state.file_id = file_id
 
 
 def render_results(results):
-    final_df = results['final_df']
+    final_df = results['combined_df']
+    per_file = results['per_file']
+    separate = results['output_mode'] == 'separate'
 
     st.markdown("## 📊 Processing Results")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("📱 Total Records", f"{len(final_df):,}")
+        st.metric("📁 Files", f"{len(per_file):,}")
     with col2:
-        st.metric("Records with Phone1", f"{int((final_df['Phone1'] != '').sum()):,}")
+        st.metric("📱 Total Records", f"{len(final_df):,}")
     with col3:
+        st.metric("Records with Phone1", f"{int((final_df['Phone1'] != '').sum()):,}")
+    with col4:
         st.metric("Records with Phone2", f"{int((final_df['Phone2'] != '').sum()):,}")
+
+    if results['duplicates_removed']:
+        st.info(
+            f"🧹 Removed {results['duplicates_removed']:,} duplicate row(s) that "
+            "appeared in more than one file."
+        )
+
+    if results['file_breakdown'] is not None:
+        st.markdown("### 📁 Per-File Breakdown")
+        st.dataframe(
+            results['file_breakdown'], use_container_width=True, hide_index=True
+        )
 
     st.markdown("### 📋 QA Summary")
     st.dataframe(results['qa_summary'], use_container_width=True, hide_index=True)
 
-    st.markdown("### 📥 Download File")
-    st.caption(
-        "Suggested name is LC + state + county + year + month. "
-        "Edit it to add acreage or any other detail."
-    )
+    if separate:
+        st.markdown("### 📥 Download Files")
+        st.caption(
+            "Each upload is exported as its own .xlsx inside the zip, named "
+            "LC + state + county + year + month. The name below is the zip's."
+        )
+        extension, mime, label = '.zip', 'application/zip', '📥 Download Zip of Files'
+    else:
+        st.markdown("### 📥 Download File")
+        st.caption(
+            "Suggested name is LC + state + county + year + month. "
+            "Edit it to add acreage or any other detail."
+        )
+        extension = '.xlsx'
+        mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        label = '📥 Download Launch Control File'
 
     name = st.text_input(
         "File name",
         value=results['suggested_name'],
         key="download_filename",
-        help="The .xlsx extension is added automatically.",
+        help=f"The {extension} extension is added automatically.",
     )
-    final_name = f"{sanitize_filename(name)}.xlsx"
+    final_name = f"{sanitize_filename(name)}{extension}"
     st.caption(f"Saving as **{final_name}**")
 
     st.download_button(
-        label="📥 Download Launch Control File",
-        data=results['excel_bytes'],
+        label=label,
+        data=results['download_bytes'],
         file_name=final_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mime=mime,
         use_container_width=True,
     )
+
+    if separate:
+        with st.expander("📦 Files in the Zip"):
+            for entry in results['zip_entries']:
+                st.markdown(f"- `{entry}`")
 
     with st.expander("📋 Output Preview"):
         st.dataframe(final_df.head(20), use_container_width=True)
@@ -606,102 +790,214 @@ def main():
 
     st.title("📞 Launch Control Template Converter")
     st.markdown(
-        "Upload any broker export and convert it to the Launch Control import "
-        "template with the top 3 phone numbers per contact."
+        "Upload one or more broker exports that share the same template and "
+        "convert them to the Launch Control import format with the top 3 phone "
+        "numbers per contact."
     )
 
     with st.sidebar:
         st.header("⚙️ About This Tool")
         st.success("✅ Reads .xlsx, .xls and .csv exports")
+        st.success("✅ Converts many files at once with one mapping")
         st.success("✅ Works with any broker's column names")
         st.success("✅ Skips a blank leading row automatically")
         st.success("✅ Takes the first 3 distinct phone numbers")
         st.success("✅ Suggests a standardized, editable file name")
 
-    uploaded_file = st.file_uploader(
-        "Choose an Excel or CSV file",
+    uploaded_files = st.file_uploader(
+        "Choose Excel or CSV files",
         type=['xlsx', 'xls', 'csv'],
-        help="Upload any Excel or CSV file with contact and phone data",
+        accept_multiple_files=True,
+        help="Upload one or more files that share the same column layout",
     )
 
-    if uploaded_file is None:
-        st.session_state.file_id = None
+    if not uploaded_files:
+        st.session_state.file_signature = None
+        st.session_state.columns_signature = None
+        st.session_state.loaded = None
         st.session_state.results = None
-        st.info("👆 Please upload an Excel or CSV file to get started")
+        st.info("👆 Please upload one or more Excel or CSV files to get started")
         with st.expander("📖 Instructions", expanded=True):
             st.markdown(
                 """
                 **How to use this converter:**
 
-                1. Upload any Excel (.xlsx/.xls) or CSV export with contact and phone data
-                2. Map your columns to the Launch Control fields
+                1. Upload one or more Excel (.xlsx/.xls) or CSV exports with contact
+                   and phone data — pull them from the same source so they share a
+                   column layout
+                2. Map your columns to the Launch Control fields — the mapping is
+                   read from the first file and applied to all of them
                 3. Map your phone columns in priority order
-                4. Process the file
-                5. Adjust the suggested file name and download
+                4. Choose one combined file or one file per upload
+                5. Process, adjust the suggested file name and download
 
                 **What it does:**
                 - Detects and skips a blank first row before the real headers
                 - Auto-detects CSV delimiter and encoding
                 - Keeps every contact row, one row in, one row out
                 - Exports the first 3 distinct valid numbers per contact
+                - Flags any file whose columns don't match the first one
                 - Names the file `LC` + state + county + year + month
                 """
             )
         return
 
     try:
-        file_id = f"{uploaded_file.name}:{uploaded_file.size}"
-        if st.session_state.file_id != file_id:
-            reset_for_new_file(file_id)
+        file_signature = tuple(sorted((f.name, f.size) for f in uploaded_files))
+        if st.session_state.file_signature != file_signature:
+            with st.spinner(f"📖 Loading {len(uploaded_files)} file(s)..."):
+                st.session_state.loaded = load_uploads(uploaded_files)
+            st.session_state.file_signature = file_signature
+            st.session_state.results = None
 
-        with st.spinner("📖 Loading file..."):
-            df, header_idx = load_table(uploaded_file)
+        loaded, empty, failed = st.session_state.loaded
 
-        st.success("✅ File loaded successfully!")
-        if header_idx > 0:
+        for name, message in failed:
+            st.error(f"❌ Could not read **{name}**: {message}")
+        for name in empty:
+            st.warning(f"⚠️ **{name}** has headers but no data rows — skipped.")
+
+        if not loaded:
+            st.error("❌ None of the uploaded files had readable data rows.")
+            return
+
+        st.success(f"✅ Loaded {len(loaded)} file(s) successfully!")
+
+        skipped_rows = [item for item in loaded if item['header_idx'] > 0]
+        if skipped_rows:
             st.info(
-                f"ℹ️ Skipped {header_idx} blank row(s) — using row {header_idx + 1} "
-                "as the column headers."
+                "ℹ️ Skipped blank leading row(s) in: "
+                + ", ".join(
+                    f"{item['name']} (row {item['header_idx'] + 1} used as headers)"
+                    for item in skipped_rows
+                )
             )
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Rows", f"{len(df):,}")
-        with col2:
-            st.metric("Total Columns", f"{len(df.columns):,}")
-        with col3:
-            st.metric("File Size", f"{uploaded_file.size / 1024 / 1024:.1f} MB")
+        canonical_columns, differences = describe_column_differences(loaded)
 
-        if df.empty:
-            st.warning("⚠️ This file has headers but no data rows.")
-            return
+        columns_signature = tuple(canonical_columns)
+        if st.session_state.columns_signature != columns_signature:
+            reset_mapping_widgets()
+            st.session_state.columns_signature = columns_signature
+            st.session_state.results = None
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Files", f"{len(loaded):,}")
+        with col2:
+            st.metric("Total Rows", f"{sum(len(i['df']) for i in loaded):,}")
+        with col3:
+            st.metric("Total Columns", f"{len(canonical_columns):,}")
+        with col4:
+            total_size = sum(i['size'] for i in loaded)
+            st.metric("Total Size", f"{total_size / 1024 / 1024:.1f} MB")
+
+        if differences:
+            st.warning(
+                f"⚠️ {len(differences)} file(s) don't match the column layout of "
+                f"**{loaded[0]['name']}**. The mapping below is built from that "
+                "file — any mapped column a file is missing comes out blank for "
+                "its rows."
+            )
+            with st.expander("Show column differences"):
+                for diff in differences:
+                    st.markdown(f"**{diff['name']}**")
+                    if diff['missing']:
+                        st.markdown("- Missing: " + ", ".join(diff['missing']))
+                    if diff['extra']:
+                        st.markdown("- Extra: " + ", ".join(diff['extra']))
 
         with st.expander("📋 Data Preview"):
-            st.dataframe(df.head(10), use_container_width=True)
-            st.markdown("**Available Columns:** " + ", ".join(df.columns.tolist()))
+            index = 0
+            if len(loaded) > 1:
+                index = st.selectbox(
+                    "Preview file",
+                    options=list(range(len(loaded))),
+                    format_func=lambda i: loaded[i]['name'],
+                    key="preview_file",
+                )
+            preview_df = loaded[index]['df']
+            st.dataframe(preview_df.head(10), use_container_width=True)
+            st.markdown(
+                "**Available Columns:** " + ", ".join(preview_df.columns.tolist())
+            )
 
-        if not create_column_mapping_interface(df):
+        if not create_column_mapping_interface(
+            loaded[0]['df'], len(loaded), loaded[0]['name']
+        ):
             return
 
-        if st.button("🚀 Process File", type="primary", use_container_width=True):
-            final_df, qa_summary = process_data_with_mapping(
-                df,
+        output_mode = 'combined'
+        drop_dupes = False
+        if len(loaded) > 1:
+            st.markdown("## 📦 Output")
+            output_mode = st.radio(
+                "How should these files be exported?",
+                options=['combined', 'separate'],
+                format_func=lambda v: (
+                    'One combined file' if v == 'combined'
+                    else 'One file per upload (.zip)'
+                ),
+                horizontal=True,
+                key="output_mode",
+            )
+            if output_mode == 'combined':
+                drop_dupes = st.checkbox(
+                    "Remove exact duplicate rows across files",
+                    value=True,
+                    key="drop_dupes",
+                    help=(
+                        "Catches the same list uploaded twice. A row is only "
+                        "dropped when every output column matches another row."
+                    ),
+                )
+
+        # Results are built for one set of output settings; changing them makes
+        # the download on screen stale, so drop it and ask for a re-run.
+        results = st.session_state.results
+        if results and (
+            results['output_mode'] != output_mode
+            or results['dedupe_enabled'] != drop_dupes
+        ):
+            st.session_state.results = None
+
+        button_label = "🚀 Process File" if len(loaded) == 1 else "🚀 Process Files"
+        if st.button(button_label, type="primary", use_container_width=True):
+            per_file = process_all_files(
+                loaded,
                 st.session_state.column_mapping,
                 st.session_state.phone_mapping,
             )
+            combined, duplicates_removed = combine_outputs(per_file, drop_dupes)
+
+            if output_mode == 'separate':
+                download_bytes, zip_entries = to_zip_bytes(per_file)
+            else:
+                download_bytes, zip_entries = to_excel_bytes(combined), []
+
             st.session_state.pop('download_filename', None)
             st.session_state.results = {
-                'final_df': final_df,
-                'qa_summary': qa_summary,
-                'excel_bytes': to_excel_bytes(final_df),
-                'suggested_name': suggest_filename(final_df, uploaded_file.name),
+                'per_file': per_file,
+                'combined_df': combined,
+                'duplicates_removed': duplicates_removed,
+                'qa_summary': generate_qa_report(
+                    per_file, combined, duplicates_removed, drop_dupes
+                ),
+                'file_breakdown': (
+                    generate_file_breakdown(per_file) if len(per_file) > 1 else None
+                ),
+                'output_mode': output_mode,
+                'dedupe_enabled': drop_dupes,
+                'download_bytes': download_bytes,
+                'zip_entries': zip_entries,
+                'suggested_name': suggest_filename(combined, loaded[0]['name']),
             }
 
         if st.session_state.results:
             render_results(st.session_state.results)
 
     except Exception as e:
-        st.error(f"❌ Error processing file: {e}")
+        st.error(f"❌ Error processing files: {e}")
         with st.expander("Error Details"):
             st.exception(e)
 
